@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solar export forecasting with LSTMs</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-left" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></symbol>
+  <symbol id="i-right" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 20h16"/></symbol>
+  <symbol id="i-shuffle" viewBox="0 0 24 24"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></symbol>
+  <symbol id="i-reset" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></symbol>
+  <symbol id="i-pointer" viewBox="0 0 24 24"><path d="M9 3v10l3-3 2.5 6 2-1-2.5-5.5H18z"/></symbol>
+</svg>
+
+<header class="top">
+  <div>
+    <h1>Short-term solar export forecasting with LSTMs</h1>
+    <p class="byline">Josua Vorster · North-West University, ITRI671</p>
+  </div>
+  <div class="source">
+    <select id="source" class="select" aria-label="Dataset"></select>
+    <label class="btn" title="Upload a CSV or Excel file in the dataset.xlsx format">
+      <svg class="ic"><use href="#i-upload"/></svg>Upload data
+      <input type="file" id="file" accept=".csv,.xlsx,.xls" hidden>
+    </label>
+  </div>
+</header>
+
+<nav class="toolbar" aria-label="What to show">
+  <div class="field">
+    <span class="field-label">Site</span>
+    <div class="seg" id="sites" role="group" aria-label="Site"></div>
+  </div>
+  <div class="field">
+    <span class="field-label">Period</span>
+    <div class="seg" id="ranges" role="group" aria-label="Period length">
+      <button data-hours="24">24 h</button>
+      <button data-hours="72">3 days</button>
+      <button data-hours="168">7 days</button>
+      <button data-hours="0">Custom</button>
+    </div>
+  </div>
+  <div class="pager">
+    <button class="icon-btn" id="prev" aria-label="Earlier period" title="Earlier (Shift + ←)"><svg class="ic"><use href="#i-left"/></svg></button>
+    <span id="period" class="period"></span>
+    <button class="icon-btn" id="next" aria-label="Later period" title="Later (Shift + →)"><svg class="ic"><use href="#i-right"/></svg></button>
+  </div>
+  <button class="btn btn-quiet" id="random" title="Jump to a random period for this site"><svg class="ic"><use href="#i-shuffle"/></svg>Random</button>
+  <div class="custom" id="custom" hidden>
+    <label>From <input type="datetime-local" id="from" step="3600"></label>
+    <label>To <input type="datetime-local" id="to" step="3600"></label>
+  </div>
+</nav>
+
+<section class="kpis" aria-label="Accuracy in this period">
+  <div class="kpi hero">
+    <span class="kpi-label">Champion error (RMSE)</span>
+    <span class="kpi-value"><b id="k-rmse"></b> kWh</span>
+    <span class="kpi-sub">typical miss per hour in this period</span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Versus Baseline BiLSTM</span>
+    <span class="kpi-value"><b id="k-gain"></b></span>
+    <span class="kpi-sub" id="k-gain-sub"></span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Fit (R²)</span>
+    <span class="kpi-value"><b id="k-r2"></b></span>
+    <span class="kpi-sub" id="k-r2-sub"></span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Energy exported</span>
+    <span class="kpi-value"><b id="k-energy"></b> kWh</span>
+    <span class="kpi-sub" id="k-energy-sub"></span>
+  </div>
+</section>
+
+<div class="workspace">
+  <section class="card chart-card" id="chart-card">
+    <div class="card-head">
+      <div>
+        <h2>Actual vs predicted export</h2>
+        <p class="sub">Hourly kWh. Each prediction uses the previous 24 hours. <span class="hint">Click an hour to inspect it, or use ← →.</span></p>
+      </div>
+      <div class="toggles">
+        <label class="switch" title="Show the Baseline BiLSTM on the chart"><input type="checkbox" id="baseline" checked><span></span>Baseline</label>
+        <label class="switch" title="ADR 0004: force predictions to 0 at night (hour 20 to 05 or no sun) and clip negatives"><input type="checkbox" id="mask"><span></span>Zero at night</label>
+      </div>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div class="chart main"><canvas id="chart" aria-label="Line chart of actual and predicted hourly export" role="img"></canvas></div>
+    <div class="residual-head">
+      <h3>Residual</h3><span class="sub">actual minus Champion. Above 0: the model under-predicted.</span>
+    </div>
+    <div class="chart small"><canvas id="residual" aria-label="Bar chart of residuals" role="img"></canvas></div>
+  </section>
+
+  <aside class="card panel" aria-labelledby="wi-heading">
+    <div class="panel-head">
+      <h2 id="wi-heading">What if?</h2>
+      <button class="btn btn-quiet btn-sm" id="wi-reset" disabled><svg class="ic"><use href="#i-reset"/></svg>Reset</button>
+    </div>
+    <p class="sub">Change the weather the model sees. The <span class="key-whatif">teal line</span> redraws for every hour on the chart.</p>
+
+    <div class="readout" id="readout">
+      <div class="ro-label" id="ro-label"></div>
+      <div class="ro-main">
+        <span class="ro-value" id="ro-value"></span><span class="ro-unit">kWh</span>
+        <span class="delta" id="ro-delta" hidden></span>
+      </div>
+      <div class="ro-rows" id="ro-rows"></div>
+    </div>
+
+    <div class="presets" id="presets" role="group" aria-label="Weather presets"></div>
+
+    <div class="sliders" id="weather-sliders"></div>
+
+    <details class="more" id="context">
+      <summary>Time, site and history <span class="count" id="ctx-count" hidden></span></summary>
+      <div class="sliders">
+        <div class="slider pick">
+          <label for="o-site">Treat as site</label>
+          <select id="o-site" class="select select-sm"><option value="0">Same</option></select>
+        </div>
+        <div class="slider pick">
+          <label for="o-month">Treat as month</label>
+          <select id="o-month" class="select select-sm"><option value="0">Same</option></select>
+        </div>
+        <div id="context-sliders"></div>
+      </div>
+    </details>
+  </aside>
+</div>
+
+<section class="details">
+  <details>
+    <summary>All accuracy metrics for this period</summary>
+    <table class="metrics">
+      <thead><tr><th>Model</th><th>MSE</th><th>RMSE (kWh)</th><th>MAE (kWh)</th><th>R²</th></tr></thead>
+      <tbody id="metrics"></tbody>
+    </table>
+  </details>
+  <details>
+    <summary>Hourly data table</summary>
+    <div class="scroll"><table id="table"></table></div>
+  </details>
+  <details>
+    <summary>Upload file format</summary>
+    <p>One row per site per hour, same columns as <code>dataset.xlsx</code>:</p>
+    <p><code>Timestamp, Site_Name, ExpkWh, shortwave_radiation, cloud_cover, temperature_2m, precipitation, relative_humidity_2m, wind_speed_10m</code></p>
+    <p>Weather columns must already be scaled to 0..1. <code>Site_Name</code> is 1 to 7 (or "Site 3"). Each site needs more than 24 consecutive hours. Other columns are ignored.</p>
+  </details>
+</section>
+
+<div class="toast" id="error" role="alert" hidden></div>
+
+<script src="{{ url_for('static', filename='chart.umd.min.js') }}"></script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
